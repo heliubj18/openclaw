@@ -287,6 +287,52 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     });
 
   sessionsCmd
+    .command("diagnose [session-key]")
+    .description("Diagnose a session that appears slow or stuck")
+    .option("--json", "Output as JSON", false)
+    .option("--store <path>", "Path to session store (default: resolved from config)")
+    .option("--agent <id>", "Agent id to inspect (default: configured default agent)")
+    .option("--all-agents", "Aggregate sessions across all configured agents", false)
+    .option("--limit <n>", "Number of recent trajectory events to include", "20")
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.heading("Examples:")}\n${formatHelpExamples([
+          ["openclaw sessions diagnose", "Diagnose the most recently active session."],
+          [
+            "openclaw sessions diagnose agent:main:telegram:direct:owner",
+            "Diagnose a specific session.",
+          ],
+          ["openclaw sessions diagnose --json", "Machine-readable output."],
+          ["openclaw sessions diagnose --limit 50", "Include more trajectory events."],
+        ])}`,
+    )
+    .action(async (sessionKey, opts, command) => {
+      const parentOpts = command.parent?.opts() as
+        | {
+            store?: string;
+            agent?: string;
+            allAgents?: boolean;
+            json?: boolean;
+          }
+        | undefined;
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { sessionsDiagnoseCommand } = await import("../../commands/sessions-diagnose.js");
+        await sessionsDiagnoseCommand(
+          {
+            sessionKey: sessionKey as string | undefined,
+            store: (opts.store as string | undefined) ?? parentOpts?.store,
+            agent: (opts.agent as string | undefined) ?? parentOpts?.agent,
+            allAgents: Boolean(opts.allAgents || parentOpts?.allAgents),
+            json: Boolean(opts.json || parentOpts?.json),
+            limit: opts.limit as string | undefined,
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  sessionsCmd
     .command("tail")
     .description("Tail human-readable session trajectory progress")
     .option("--session-key <key>", "Session key to tail (default: active sessions or latest)")

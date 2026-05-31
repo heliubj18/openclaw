@@ -61,7 +61,76 @@ openclaw sessions --all-agents tail --follow
 
 The progress view is intentionally conservative: prompt text, tool arguments, and tool result bodies are not printed. Tool calls show the tool name with `{...redacted...}`; tool results show status such as `ok`, `error`, or `done`; model completion lines show provider/model and terminal status.
 
-Export a trajectory bundle for a stored session:
+## Diagnose stuck sessions
+
+Diagnose a session that appears slow or stuck:
+
+```bash
+openclaw sessions diagnose
+openclaw sessions diagnose "agent:main:telegram:direct:123"
+openclaw sessions diagnose --json
+openclaw sessions diagnose --limit 50
+```
+
+`openclaw sessions diagnose` gathers diagnostic data from multiple sources
+(session store, ACP metadata, trajectory events, lock files, and live diagnostic
+activity) and classifies the session state. Without `--session-key`, it picks
+the most recently active session.
+
+Classifications:
+
+| Classification     | Meaning                                   |
+| ------------------ | ----------------------------------------- |
+| `idle`             | Session is idle; no recent activity       |
+| `processing`       | Session is actively processing            |
+| `model_call`       | Waiting for model response                |
+| `tool_call`        | Executing a tool                          |
+| `quota_suspended`  | Suspended due to rate limit or quota      |
+| `delivery_pending` | Pending final delivery after restart      |
+| `subagent_wedged`  | Subagent recovery detected a wedged run   |
+| `blocked`          | Session goal is blocked or usage-limited  |
+| `lock_held`        | Session lock held by another process      |
+| `stale`            | No activity for 30+ minutes; may be stuck |
+| `unknown`          | Unable to determine state                 |
+
+Options:
+
+- `--json`: emit full diagnosis as JSON
+- `--store <path>`: explicit session store path
+- `--agent <id>`: one configured agent
+- `--all-agents`: aggregate all configured agents
+- `--limit <n>`: number of recent trajectory events to include (default `20`)
+
+The human-readable output includes session metadata, ACP runtime state, recent
+trajectory events, lock file status, and live diagnostic activity when available.
+
+JSON example:
+
+```json
+{
+  "sessionKey": "agent:main:telegram:direct:123",
+  "sessionId": "a1b2c3d4-...",
+  "agentId": "main",
+  "classification": "model_call",
+  "summary": "Waiting for model response (prompt submitted, no completion recorded)",
+  "session": {
+    "updatedAt": 1719000000000,
+    "ageMs": 45000,
+    "status": "running",
+    "modelProvider": "openai",
+    "model": "gpt-4o"
+  },
+  "trajectory": {
+    "hasPendingPrompt": true,
+    "hasPendingToolCall": false,
+    "lastEvents": [...]
+  },
+  "lock": { "exists": false },
+  "activity": {}
+}
+```
+
+## Export trajectory
 
 ```bash
 openclaw sessions export-trajectory --session-key "agent:main:telegram:direct:123" --workspace .
