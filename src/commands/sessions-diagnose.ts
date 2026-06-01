@@ -8,9 +8,7 @@ import { resolveSessionFilePath } from "../config/sessions/paths.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { isTerminalSessionStatus } from "../config/sessions/types.js";
 import { resolveStoredSessionKeyForAgentStore } from "../gateway/session-store-key.js";
-import { formatErrorMessage } from "../infra/errors.js";
 import { getDiagnosticSessionActivitySnapshot } from "../logging/diagnostic-run-activity.js";
-import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 import { isPidAlive } from "../shared/pid-alive.js";
 import { resolveTrajectoryFilePath } from "../trajectory/paths.js";
@@ -24,6 +22,7 @@ type SessionDiagnoseOptions = {
   agent?: string;
   allAgents?: boolean;
   json?: boolean;
+  brief?: boolean;
   limit?: string;
 };
 
@@ -44,6 +43,7 @@ type DiagnosisEvent = {
   type: string;
   ts: string;
   preview?: string;
+  event: TrajectoryEvent;
 };
 
 type SessionDiagnosis = {
@@ -102,7 +102,7 @@ type SessionDiagnosis = {
   };
 };
 
-const DEFAULT_EVENT_LIMIT = 20;
+const DEFAULT_EVENT_LIMIT = 50;
 const RECENT_THRESHOLD_MS = 5 * 60_000; // 5 minutes
 const STALE_THRESHOLD_MS = 30 * 60_000; // 30 minutes
 
@@ -210,6 +210,7 @@ function toDiagnosisEvent(event: TrajectoryEvent): DiagnosisEvent {
     type: event.type,
     ts: event.ts,
     preview: eventPreview(event),
+    event,
   };
 }
 
@@ -232,14 +233,12 @@ function analyzeTrajectory(events: TrajectoryEvent[]): TrajectoryAnalysis {
   // Walk events in chronological order to find unmatched prompt/tool calls
   let lastPromptSubmittedAt: string | undefined;
   let lastToolCallName: string | undefined;
-  let lastToolCallAt: string | undefined;
 
   for (const event of events) {
     switch (event.type) {
       case "prompt.submitted":
         lastPromptSubmittedAt = event.ts;
         lastToolCallName = undefined;
-        lastToolCallAt = undefined;
         break;
       case "model.completed":
       case "model.call.error":
@@ -249,19 +248,16 @@ function analyzeTrajectory(events: TrajectoryEvent[]): TrajectoryAnalysis {
       case "tool.call":
         lastToolCallName =
           toOptionalString(event.data?.name) ?? toOptionalString(event.data?.toolName);
-        lastToolCallAt = event.ts;
         break;
       case "tool.result":
       case "tool.timeout":
         lastToolCallName = undefined;
-        lastToolCallAt = undefined;
         lastToolResultAt = event.ts;
         break;
       case "session.ended":
         // Session ended clears all pending state
         lastPromptSubmittedAt = undefined;
         lastToolCallName = undefined;
-        lastToolCallAt = undefined;
         break;
       default:
         break;
@@ -499,6 +495,343 @@ function formatAge(ms: number | undefined): string {
   return `${Math.round(ms / 86_400_000)}d`;
 }
 
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) {
+    return text;
+  }
+  return text.slice(0, maxLen - 3) + "...";
+}
+
+function formatTokens(usage: Record<string, unknown> | undefined): string {
+  if (!usage || !isRecord(usage)) {
+    return "";
+  }
+  const parts: string[] = [];
+  if (typeof usage.input === "number" && usage.input > 0) {
+    parts.push(`in:${usage.input}`);
+  }
+  if (typeof usage.output === "number" && usage.output > 0) {
+    parts.push(`out:${usage.output}`);
+  }
+  if (typeof usage.cacheRead === "number" && usage.cacheRead > 0) {
+    parts.push(`cache:${usage.cacheRead}`);
+  }
+  if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) {
+    parts.push(`reason:${usage.reasoningTokens}`);
+  }
+  if (typeof usage.total === "number" && usage.total > 0 && parts.length === 0) {
+    parts.push(`total:${usage.total}`);
+  }
+  return parts.join(" ");
+}
+
+function computeDurationMs(startTs: string, endTs: string): number | undefined {
+  const start = new Date(startTs).getTime();
+  const end = new Date(endTs).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) {
+    return undefined;
+  }
+  return end - start;
+}
+
+type Round = {
+  startedAt: string | undefined;
+  events: DiagnosisEvent[];
+};
+
+function groupIntoRounds(events: DiagnosisEvent[]): Round[] {
+  const rounds: Round[] = [];
+  let current: Round = { startedAt: undefined, events: [] };
+  for (const ev of events) {
+    if (ev.type === "session.started") {
+      if (current.events.length > 0) {
+        rounds.push(current);
+      }
+      current = { startedAt: ev.ts, events: [ev] };
+    } else {
+      current.events.push(ev);
+    }
+  }
+  if (current.events.length > 0) {
+    rounds.push(current);
+  }
+  return rounds;
+}
+
+function renderEventLine(
+  ev: DiagnosisEvent,
+  prevEvent: DiagnosisEvent | undefined,
+  rich: boolean,
+): string[] {
+  const ts = formatTimestamp(ev.ts);
+  const data = ev.event.data;
+  const lines: string[] = [];
+  const indent = "    ";
+
+  switch (ev.type) {
+    case "session.started": {
+      const trigger = toOptionalString(data?.trigger) ?? "unknown";
+      const toolCount = typeof data?.toolCount === "number" ? data.toolCount : undefined;
+      lines.push(
+        `${indent}${ts}  ${colorize(rich, theme.heading, "Session started")} (trigger: ${trigger}${toolCount !== undefined ? `, ${toolCount} tools` : ""})`,
+      );
+      break;
+    }
+    case "context.compiled": {
+      const tools = Array.isArray(data?.tools) ? data.tools.length : undefined;
+      const prompt = toOptionalString(data?.prompt);
+      lines.push(
+        `${indent}${ts}  Context compiled${tools !== undefined ? ` (${tools} tools)` : ""}`,
+      );
+      if (prompt) {
+        lines.push(`${indent}      prompt: ${truncate(prompt.replace(/\s+/gu, " "), 120)}`);
+      }
+      break;
+    }
+    case "prompt.submitted": {
+      const prompt = toOptionalString(data?.prompt);
+      const images = typeof data?.imagesCount === "number" ? data.imagesCount : 0;
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.success, "Prompt submitted")}`);
+      if (prompt) {
+        lines.push(`${indent}      text: ${truncate(prompt.replace(/\s+/gu, " "), 200)}`);
+      }
+      if (images > 0) {
+        lines.push(`${indent}      images: ${images}`);
+      }
+      break;
+    }
+    case "prompt.skipped": {
+      const reason = toOptionalString(data?.reason) ?? "unknown";
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.warn, `Prompt skipped: ${reason}`)}`);
+      break;
+    }
+    case "model.completed": {
+      const provider = ev.event.provider?.trim();
+      const model = ev.event.modelId?.trim();
+      const label = provider && model ? `${provider}/${model}` : model || provider || "model";
+      const isTimeout = data?.timedOut === true;
+      const isAborted = data?.aborted === true;
+      const hasError = toOptionalString(data?.promptError) ?? toOptionalString(data?.terminalError);
+      let status: string;
+      if (hasError) {
+        status = colorize(rich, theme.error, `ERROR: ${hasError}`);
+      } else if (isTimeout) {
+        status = colorize(rich, theme.warn, "TIMEOUT");
+      } else if (isAborted) {
+        status = colorize(rich, theme.warn, "ABORTED");
+      } else {
+        status = colorize(rich, theme.success, "done");
+      }
+
+      // Duration from previous prompt.submitted
+      let duration = "";
+      if (prevEvent?.type === "prompt.submitted") {
+        const ms = computeDurationMs(prevEvent.ts, ev.ts);
+        if (ms !== undefined) {
+          duration = ` (${formatAge(ms)})`;
+        }
+      }
+
+      const tokens = formatTokens(data?.usage as Record<string, unknown> | undefined);
+      lines.push(
+        `${indent}${ts}  ${colorize(rich, theme.heading, "Model completed")} ${label} ${status}${duration}`,
+      );
+      if (tokens) {
+        lines.push(`${indent}      tokens: ${tokens}`);
+      }
+      if (typeof data?.compactionCount === "number" && data.compactionCount > 0) {
+        lines.push(`${indent}      compactions: ${data.compactionCount}`);
+      }
+      // Show assistant text preview
+      const assistantTexts = Array.isArray(data?.assistantTexts) ? data.assistantTexts : [];
+      if (assistantTexts.length > 0) {
+        const text = assistantTexts.map((t: unknown) => (typeof t === "string" ? t : "")).join(" ");
+        if (text.trim()) {
+          lines.push(`${indent}      response: ${truncate(text.replace(/\s+/gu, " "), 200)}`);
+        }
+      }
+      // Show error details
+      if (data?.promptErrorSource) {
+        lines.push(`${indent}      error source: ${data.promptErrorSource}`);
+      }
+      break;
+    }
+    case "model.call.error": {
+      const error =
+        toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "unknown error";
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.error, `Model call error: ${error}`)}`);
+      break;
+    }
+    case "model.fallback_step": {
+      const step = toOptionalString(data?.step) ?? toOptionalString(data?.status) ?? "fallback";
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.warn, `Model fallback: ${step}`)}`);
+      break;
+    }
+    case "tool.call": {
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      const args = data?.arguments;
+      let argsPreview = "";
+      if (isRecord(args)) {
+        argsPreview = truncate(JSON.stringify(args), 150);
+      } else if (typeof args === "string") {
+        argsPreview = truncate(args, 150);
+      }
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.heading, `Tool call: ${name}`)}`);
+      if (argsPreview) {
+        lines.push(`${indent}      args: ${argsPreview}`);
+      }
+      break;
+    }
+    case "tool.result": {
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      const success = data?.success;
+      const isError = success === false;
+      const statusStr = isError
+        ? colorize(rich, theme.error, "ERROR")
+        : colorize(rich, theme.success, "ok");
+      lines.push(`${indent}${ts}  Tool result: ${name} ${statusStr}`);
+      // Show error message from result
+      if (isError) {
+        const errMsg = toOptionalString(data?.error) ?? toOptionalString(data?.message);
+        if (errMsg) {
+          lines.push(`${indent}      error: ${truncate(errMsg, 200)}`);
+        }
+      }
+      break;
+    }
+    case "tool.timeout": {
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      lines.push(`${indent}${ts}  ${colorize(rich, theme.error, `Tool timeout: ${name}`)}`);
+      break;
+    }
+    case "trace.artifacts": {
+      const finalStatus = toOptionalString(data?.finalStatus);
+      const toolMetas = Array.isArray(data?.toolMetas) ? data.toolMetas : [];
+      const lastToolError = toOptionalString(data?.lastToolError);
+      if (finalStatus && finalStatus !== "success") {
+        lines.push(`${indent}${ts}  ${colorize(rich, theme.warn, `Artifacts: ${finalStatus}`)}`);
+      }
+      if (toolMetas.length > 0) {
+        const toolNames = toolMetas
+          .map((m: unknown) => (isRecord(m) ? (toOptionalString(m.toolName) ?? "?") : "?"))
+          .join(", ");
+        lines.push(`${indent}      tools used: ${toolNames}`);
+      }
+      if (lastToolError) {
+        lines.push(
+          `${indent}      ${colorize(rich, theme.error, `last tool error: ${truncate(lastToolError, 200)}`)}`,
+        );
+      }
+      const artifactsTokens = formatTokens(data?.usage as Record<string, unknown> | undefined);
+      if (artifactsTokens) {
+        lines.push(`${indent}      total tokens: ${artifactsTokens}`);
+      }
+      break;
+    }
+    case "session.ended": {
+      const status = toOptionalString(data?.status) ?? "ended";
+      const isOk = status === "success";
+      const statusColor = isOk ? theme.success : theme.error;
+      const timedOut = data?.timedOut === true;
+      const terminalError = toOptionalString(data?.terminalError);
+      let detail = "";
+      if (terminalError) {
+        detail = ` - ${terminalError}`;
+      } else if (timedOut) {
+        detail = " (timed out)";
+      }
+      lines.push(
+        `${indent}${ts}  ${colorize(rich, statusColor, `Session ended: ${status}${detail}`)}`,
+      );
+      break;
+    }
+    case "trace.metadata": {
+      const harness = data?.harness;
+      const modelInfo = data?.model;
+      if (isRecord(modelInfo)) {
+        const prov = toOptionalString(modelInfo.provider) ?? "";
+        const name = toOptionalString(modelInfo.name) ?? "";
+        const api = toOptionalString(modelInfo.api) ?? "";
+        lines.push(`${indent}${ts}  Model: ${prov}/${name} (api: ${api})`);
+      }
+      if (isRecord(harness)) {
+        const ver = toOptionalString(harness.version) ?? "";
+        const sha = toOptionalString(harness.gitSha)?.slice(0, 8) ?? "";
+        lines.push(`${indent}      harness: ${ver} (${sha})`);
+      }
+      break;
+    }
+    case "trace.truncated": {
+      lines.push(
+        `${indent}${ts}  ${colorize(rich, theme.warn, "Trajectory truncated (file size limit)")}`,
+      );
+      break;
+    }
+    default: {
+      const preview = ev.preview ?? ev.type;
+      lines.push(`${indent}${ts}  ${ev.type}: ${preview}`);
+      break;
+    }
+  }
+  return lines;
+}
+
+function hasRoundErrors(round: Round): boolean {
+  for (const ev of round.events) {
+    const data = ev.event.data;
+    if (ev.type === "model.completed") {
+      if (data?.timedOut || data?.aborted || data?.promptError || data?.terminalError) {
+        return true;
+      }
+    }
+    if (ev.type === "model.call.error" || ev.type === "tool.timeout") {
+      return true;
+    }
+    if (ev.type === "tool.result" && data?.success === false) {
+      return true;
+    }
+    if (ev.type === "session.ended" && data?.status !== "success") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderBriefRound(round: Round, roundIdx: number): string[] {
+  const lines: string[] = [];
+  const ts = round.startedAt ? formatTimestamp(round.startedAt) : "??";
+  lines.push(`  Round ${roundIdx + 1} (${ts}):`);
+  for (const ev of round.events) {
+    const data = ev.event.data;
+    const evTs = formatTimestamp(ev.ts);
+    if (ev.type === "model.completed") {
+      const err = toOptionalString(data?.promptError) ?? toOptionalString(data?.terminalError);
+      if (err) {
+        lines.push(`    ${evTs}  model error: ${err}`);
+      } else if (data?.timedOut) {
+        lines.push(`    ${evTs}  model timeout`);
+      } else if (data?.aborted) {
+        lines.push(`    ${evTs}  model aborted`);
+      }
+    } else if (ev.type === "model.call.error") {
+      lines.push(
+        `    ${evTs}  model call error: ${toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "unknown"}`,
+      );
+    } else if (ev.type === "tool.result" && data?.success === false) {
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      const errMsg = toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "";
+      lines.push(`    ${evTs}  ${name} error: ${truncate(errMsg, 200)}`);
+    } else if (ev.type === "tool.timeout") {
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      lines.push(`    ${evTs}  ${name} timeout`);
+    } else if (ev.type === "session.ended" && data?.status !== "success") {
+      const err = toOptionalString(data?.terminalError) ?? "";
+      lines.push(`    ${evTs}  ended: ${data?.status ?? "unknown"}${err ? ` - ${err}` : ""}`);
+    }
+  }
+  return lines;
+}
+
 function classificationLabel(c: StuckClassification): string {
   switch (c) {
     case "idle":
@@ -604,23 +937,41 @@ function writeTextOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void
     runtime.log("");
   }
 
-  // Trajectory section
+  // Trajectory section - grouped by rounds
   const t = diagnosis.trajectory;
-  runtime.log(colorize(rich, theme.heading, `Trajectory (last ${t.lastEvents.length} events)`));
-  if (t.lastEvents.length === 0) {
+  const rounds = groupIntoRounds(t.lastEvents);
+  runtime.log(
+    colorize(
+      rich,
+      theme.heading,
+      `Execution Timeline (${t.lastEvents.length} events, ${rounds.length} rounds)`,
+    ),
+  );
+  if (rounds.length === 0) {
     runtime.log("  No trajectory events found");
   } else {
-    for (const event of t.lastEvents) {
-      const ts = formatTimestamp(event.ts);
-      const type = event.type.padEnd(20);
-      const preview = event.preview ?? "";
-      const isPending =
-        (event.type === "prompt.submitted" &&
-          event === t.lastEvents[t.lastEvents.length - 1] &&
-          t.hasPendingPrompt) ||
-        (event.type === "tool.call" && t.hasPendingToolCall !== undefined);
-      const marker = isPending ? colorize(rich, theme.warn, "  <-- pending") : "";
-      runtime.log(`  ${ts}  ${type} ${preview}${marker}`);
+    for (let ri = 0; ri < rounds.length; ri++) {
+      const round = rounds[ri];
+      const roundTs = round.startedAt ? formatTimestamp(round.startedAt) : "??";
+      runtime.log("");
+      runtime.log(colorize(rich, theme.heading, `  --- Round ${ri + 1} (${roundTs}) ---`));
+      for (let ei = 0; ei < round.events.length; ei++) {
+        const ev = round.events[ei];
+        const prev = ei > 0 ? round.events[ei - 1] : undefined;
+        const rendered = renderEventLine(ev, prev, rich);
+        for (const line of rendered) {
+          runtime.log(line);
+        }
+      }
+      // Show pending markers at round level
+      if (t.hasPendingPrompt && ri === rounds.length - 1) {
+        runtime.log(colorize(rich, theme.warn, "    <-- waiting for model response"));
+      }
+      if (t.hasPendingToolCall && ri === rounds.length - 1) {
+        runtime.log(
+          colorize(rich, theme.warn, `    <-- waiting for tool: ${t.pendingToolName ?? "unknown"}`),
+        );
+      }
     }
   }
   runtime.log("");
@@ -660,6 +1011,80 @@ function writeTextOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void
   } else {
     runtime.log(colorize(rich, theme.heading, "Diagnostic Activity"));
     runtime.log("  No active diagnostic data (session may not be in this process)");
+  }
+}
+
+function writeBriefOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void {
+  const rich = isRich();
+  const classLabel = classificationLabel(diagnosis.classification);
+  const coloredClass = colorizeClassification(classLabel, diagnosis.classification, rich);
+
+  runtime.log(colorize(rich, theme.heading, `Session Diagnosis: ${diagnosis.sessionKey}`));
+  runtime.log(`Classification: ${coloredClass} -- ${diagnosis.summary}`);
+  runtime.log("");
+
+  const s = diagnosis.session;
+  if (s.quotaSuspension) {
+    runtime.log(
+      colorize(
+        rich,
+        theme.error,
+        `  Quota suspended: ${s.quotaSuspension.reason ?? "rate limit"} (${s.quotaSuspension.failedProvider ?? ""}${s.quotaSuspension.failedModel ? "/" : ""}${s.quotaSuspension.failedModel ?? ""})`,
+      ),
+    );
+  }
+  if (s.subagentRecovery) {
+    runtime.log(
+      colorize(
+        rich,
+        theme.error,
+        `  Subagent wedged: ${s.subagentRecovery.wedgedReason ?? "unknown"}`,
+      ),
+    );
+  }
+  if (
+    s.goal &&
+    (s.goal.status === "blocked" ||
+      s.goal.status === "usage_limited" ||
+      s.goal.status === "budget_limited")
+  ) {
+    runtime.log(colorize(rich, theme.warn, `  Goal ${s.goal.status}`));
+  }
+
+  // Show only error rounds from trajectory
+  const t = diagnosis.trajectory;
+  const rounds = groupIntoRounds(t.lastEvents);
+  const errorRounds = rounds.filter((r) => hasRoundErrors(r));
+  if (errorRounds.length > 0) {
+    runtime.log("");
+    runtime.log(
+      colorize(rich, theme.heading, `Error Rounds (${errorRounds.length} of ${rounds.length}):`),
+    );
+    for (let i = 0; i < rounds.length; i++) {
+      if (hasRoundErrors(rounds[i])) {
+        const lines = renderBriefRound(rounds[i], i);
+        for (const line of lines) {
+          runtime.log(line);
+        }
+      }
+    }
+  } else if (rounds.length > 0) {
+    runtime.log("");
+    runtime.log(
+      colorize(rich, theme.success, `  All ${rounds.length} rounds completed without errors.`),
+    );
+  }
+
+  // Lock
+  if (diagnosis.lock.exists && diagnosis.lock.pidAlive) {
+    runtime.log("");
+    runtime.log(
+      colorize(
+        rich,
+        theme.warn,
+        `  Lock held by PID ${diagnosis.lock.pid ?? "unknown"} (${formatAge(diagnosis.lock.ageMs)} ago)`,
+      ),
+    );
   }
 }
 
@@ -881,7 +1306,11 @@ export async function sessionsDiagnoseCommand(
     return;
   }
 
-  writeTextOutput(diagnosis, runtime);
+  if (opts.brief) {
+    writeBriefOutput(diagnosis, runtime);
+  } else {
+    writeTextOutput(diagnosis, runtime);
+  }
 }
 
 export const testing = {

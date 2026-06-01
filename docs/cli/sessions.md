@@ -68,6 +68,7 @@ Diagnose a session that appears slow or stuck:
 ```bash
 openclaw sessions diagnose
 openclaw sessions diagnose "agent:main:telegram:direct:123"
+openclaw sessions diagnose --brief
 openclaw sessions diagnose --json
 openclaw sessions diagnose --limit 50
 ```
@@ -76,6 +77,14 @@ openclaw sessions diagnose --limit 50
 (session store, ACP metadata, trajectory events, lock files, and live diagnostic
 activity) and classifies the session state. Without `--session-key`, it picks
 the most recently active session.
+
+The default output shows a detailed execution timeline grouped by conversation
+rounds. Each round shows session start, user prompt, model completion (with
+token usage, duration, and response preview), tool calls (with arguments), tool
+results, and session end status. Errors and timeouts are highlighted.
+
+Use `--brief` to show only rounds that contain errors, tool failures, or
+timeouts. This is useful when scanning many rounds to find the one that failed.
 
 Classifications:
 
@@ -96,13 +105,16 @@ Classifications:
 Options:
 
 - `--json`: emit full diagnosis as JSON
+- `--brief`: show only rounds with errors, tool failures, or timeouts
 - `--store <path>`: explicit session store path
 - `--agent <id>`: one configured agent
 - `--all-agents`: aggregate all configured agents
-- `--limit <n>`: number of recent trajectory events to include (default `20`)
+- `--limit <n>`: number of recent trajectory events to include (default `50`)
 
-The human-readable output includes session metadata, ACP runtime state, recent
-trajectory events, lock file status, and live diagnostic activity when available.
+The human-readable output includes session metadata, ACP runtime state, a
+detailed execution timeline (grouped by conversation rounds, with tool calls,
+token usage, durations, and response previews), lock file status, and live
+diagnostic activity when available.
 
 JSON example:
 

@@ -290,6 +290,7 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .command("diagnose [session-key]")
     .description("Diagnose a session that appears slow or stuck")
     .option("--json", "Output as JSON", false)
+    .option("--brief", "Show only errors and problems (compact output)", false)
     .option("--store <path>", "Path to session store (default: resolved from config)")
     .option("--agent <id>", "Agent id to inspect (default: configured default agent)")
     .option("--all-agents", "Aggregate sessions across all configured agents", false)
@@ -303,6 +304,7 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             "openclaw sessions diagnose agent:main:telegram:direct:owner",
             "Diagnose a specific session.",
           ],
+          ["openclaw sessions diagnose --brief", "Show only errors and problems."],
           ["openclaw sessions diagnose --json", "Machine-readable output."],
           ["openclaw sessions diagnose --limit 50", "Include more trajectory events."],
         ])}`,
@@ -325,6 +327,7 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             agent: (opts.agent as string | undefined) ?? parentOpts?.agent,
             allAgents: Boolean(opts.allAgents || parentOpts?.allAgents),
             json: Boolean(opts.json || parentOpts?.json),
+            brief: Boolean(opts.brief),
             limit: opts.limit as string | undefined,
           },
           defaultRuntime,

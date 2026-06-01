@@ -409,4 +409,198 @@ describe("sessionsDiagnoseCommand", () => {
     const output = runtimeOutput(runtime);
     expect(output).toContain("model_call");
   });
+
+  it("shows detailed timeline with tool calls and model info", async () => {
+    const now = new Date().toISOString();
+    const later = new Date(Date.now() + 5000).toISOString();
+    writeStore({
+      [sessionKey]: {
+        sessionId: "session-one",
+        sessionFile: "session-one.jsonl",
+        updatedAt: Date.now(),
+        status: "done",
+      },
+    });
+    const trajectoryPath = path.join(tmpDir, "session-one.trajectory.jsonl");
+    writeJsonl(trajectoryPath, [
+      makeEvent({ type: "session.started", ts: now, seq: 1 }),
+      makeEvent({ type: "prompt.submitted", ts: now, seq: 2, data: { prompt: "Hello world" } }),
+      makeEvent({
+        type: "model.completed",
+        ts: later,
+        seq: 3,
+        provider: "openai",
+        modelId: "gpt-4o",
+        data: {
+          usage: { input: 100, output: 50, total: 150 },
+          assistantTexts: ["Hi there!"],
+        },
+      }),
+      makeEvent({ type: "session.ended", ts: later, seq: 4, data: { status: "success" } }),
+    ]);
+
+    const runtime = makeRuntime();
+    await sessionsDiagnoseCommand({ store: storePath }, runtime);
+
+    const output = runtimeOutput(runtime);
+    expect(output).toContain("Execution Timeline");
+    expect(output).toContain("Round 1");
+    expect(output).toContain("Session started");
+    expect(output).toContain("Prompt submitted");
+    expect(output).toContain("Hello world");
+    expect(output).toContain("Model completed");
+    expect(output).toContain("openai/gpt-4o");
+    expect(output).toContain("tokens:");
+    expect(output).toContain("in:100");
+    expect(output).toContain("out:50");
+    expect(output).toContain("response:");
+    expect(output).toContain("Hi there!");
+    expect(output).toContain("Session ended: success");
+  });
+
+  it("shows tool call details in timeline", async () => {
+    const now = new Date().toISOString();
+    writeStore({
+      [sessionKey]: {
+        sessionId: "session-one",
+        sessionFile: "session-one.jsonl",
+        updatedAt: Date.now(),
+        status: "done",
+      },
+    });
+    const trajectoryPath = path.join(tmpDir, "session-one.trajectory.jsonl");
+    writeJsonl(trajectoryPath, [
+      makeEvent({ type: "session.started", ts: now, seq: 1 }),
+      makeEvent({ type: "prompt.submitted", ts: now, seq: 2, data: { prompt: "run a command" } }),
+      makeEvent({
+        type: "tool.call",
+        ts: now,
+        seq: 3,
+        data: { name: "bash", arguments: { command: "ls -la" } },
+      }),
+      makeEvent({
+        type: "tool.result",
+        ts: now,
+        seq: 4,
+        data: { name: "bash", success: true },
+      }),
+      makeEvent({
+        type: "model.completed",
+        ts: now,
+        seq: 5,
+        provider: "openai",
+        modelId: "gpt-4o",
+        data: { usage: { input: 50, output: 20 } },
+      }),
+      makeEvent({ type: "session.ended", ts: now, seq: 6, data: { status: "success" } }),
+    ]);
+
+    const runtime = makeRuntime();
+    await sessionsDiagnoseCommand({ store: storePath }, runtime);
+
+    const output = runtimeOutput(runtime);
+    expect(output).toContain("Tool call: bash");
+    expect(output).toContain("ls -la");
+    expect(output).toContain("Tool result: bash");
+  });
+
+  it("shows brief output with --brief flag", async () => {
+    const now = new Date().toISOString();
+    writeStore({
+      [sessionKey]: {
+        sessionId: "session-one",
+        sessionFile: "session-one.jsonl",
+        updatedAt: Date.now(),
+        status: "done",
+      },
+    });
+    const trajectoryPath = path.join(tmpDir, "session-one.trajectory.jsonl");
+    writeJsonl(trajectoryPath, [
+      makeEvent({ type: "session.started", ts: now, seq: 1 }),
+      makeEvent({ type: "prompt.submitted", ts: now, seq: 2 }),
+      makeEvent({
+        type: "model.completed",
+        ts: now,
+        seq: 3,
+        data: {
+          promptError: "rate_limit_exceeded",
+          usage: { input: 0, output: 0 },
+        },
+      }),
+      makeEvent({ type: "session.ended", ts: now, seq: 4, data: { status: "error" } }),
+    ]);
+
+    const runtime = makeRuntime();
+    await sessionsDiagnoseCommand({ store: storePath, brief: true }, runtime);
+
+    const output = runtimeOutput(runtime);
+    expect(output).toContain("Error Rounds");
+    expect(output).toContain("model error: rate_limit_exceeded");
+    // Brief mode should NOT contain full timeline details
+    expect(output).not.toContain("Execution Timeline");
+  });
+
+  it("brief mode shows no errors when all rounds succeeded", async () => {
+    const now = new Date().toISOString();
+    writeStore({
+      [sessionKey]: {
+        sessionId: "session-one",
+        sessionFile: "session-one.jsonl",
+        updatedAt: Date.now(),
+        status: "done",
+      },
+    });
+    const trajectoryPath = path.join(tmpDir, "session-one.trajectory.jsonl");
+    writeJsonl(trajectoryPath, [
+      makeEvent({ type: "session.started", ts: now, seq: 1 }),
+      makeEvent({ type: "prompt.submitted", ts: now, seq: 2 }),
+      makeEvent({ type: "model.completed", ts: now, seq: 3, data: {} }),
+      makeEvent({ type: "session.ended", ts: now, seq: 4, data: { status: "success" } }),
+    ]);
+
+    const runtime = makeRuntime();
+    await sessionsDiagnoseCommand({ store: storePath, brief: true }, runtime);
+
+    const output = runtimeOutput(runtime);
+    expect(output).toContain("All 1 rounds completed without errors");
+  });
+
+  it("shows model error details in timeline", async () => {
+    const now = new Date().toISOString();
+    writeStore({
+      [sessionKey]: {
+        sessionId: "session-one",
+        sessionFile: "session-one.jsonl",
+        updatedAt: Date.now(),
+        status: "done",
+      },
+    });
+    const trajectoryPath = path.join(tmpDir, "session-one.trajectory.jsonl");
+    writeJsonl(trajectoryPath, [
+      makeEvent({ type: "session.started", ts: now, seq: 1 }),
+      makeEvent({ type: "prompt.submitted", ts: now, seq: 2 }),
+      makeEvent({
+        type: "model.completed",
+        ts: now,
+        seq: 3,
+        data: {
+          timedOut: true,
+          promptError: "connection_timeout",
+          usage: { input: 0, output: 0 },
+        },
+      }),
+      makeEvent({
+        type: "session.ended",
+        ts: now,
+        seq: 4,
+        data: { status: "error", timedOut: true },
+      }),
+    ]);
+
+    const runtime = makeRuntime();
+    await sessionsDiagnoseCommand({ store: storePath }, runtime);
+
+    const output = runtimeOutput(runtime);
+    expect(output).toContain("ERROR: connection_timeout");
+  });
 });
