@@ -46,12 +46,28 @@ type DiagnosisEvent = {
   event: TrajectoryEvent;
 };
 
+type FailureEntry = {
+  roundIdx: number;
+  ts: string;
+  kind:
+    | "model_error"
+    | "tool_error"
+    | "tool_timeout"
+    | "session_error"
+    | "model_timeout"
+    | "model_aborted";
+  name: string;
+  message: string;
+};
+
 type SessionDiagnosis = {
   sessionKey: string;
   sessionId: string;
   agentId: string;
   classification: StuckClassification;
   summary: string;
+  failures: FailureEntry[];
+  fixSuggestions: string[];
   session: {
     updatedAt: number | undefined;
     ageMs: number | undefined;
@@ -797,6 +813,173 @@ function hasRoundErrors(round: Round): boolean {
   return false;
 }
 
+function collectFailures(rounds: Round[]): FailureEntry[] {
+  const failures: FailureEntry[] = [];
+  for (let ri = 0; ri < rounds.length; ri++) {
+    for (const ev of rounds[ri].events) {
+      const data = ev.event.data;
+      const ts = ev.ts;
+      if (ev.type === "model.completed") {
+        if (data?.timedOut) {
+          failures.push({
+            roundIdx: ri,
+            ts,
+            kind: "model_timeout",
+            name: "model",
+            message: "Model call timed out",
+          });
+        }
+        if (data?.aborted) {
+          failures.push({
+            roundIdx: ri,
+            ts,
+            kind: "model_aborted",
+            name: "model",
+            message: "Model call aborted",
+          });
+        }
+        const promptErr = toOptionalString(data?.promptError);
+        if (promptErr) {
+          failures.push({
+            roundIdx: ri,
+            ts,
+            kind: "model_error",
+            name: "model",
+            message: promptErr,
+          });
+        }
+        const terminalErr = toOptionalString(data?.terminalError);
+        if (terminalErr) {
+          failures.push({
+            roundIdx: ri,
+            ts,
+            kind: "model_error",
+            name: "model",
+            message: terminalErr,
+          });
+        }
+      } else if (ev.type === "model.call.error") {
+        const err =
+          toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "unknown error";
+        failures.push({ roundIdx: ri, ts, kind: "model_error", name: "model", message: err });
+      } else if (ev.type === "tool.result" && data?.success === false) {
+        const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+        const errMsg = toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "failed";
+        failures.push({ roundIdx: ri, ts, kind: "tool_error", name, message: errMsg });
+      } else if (ev.type === "tool.timeout") {
+        const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+        failures.push({
+          roundIdx: ri,
+          ts,
+          kind: "tool_timeout",
+          name,
+          message: "Tool execution timed out",
+        });
+      } else if (ev.type === "session.ended" && data?.status !== "success") {
+        const err = toOptionalString(data?.terminalError) ?? data?.status ?? "unknown";
+        failures.push({
+          roundIdx: ri,
+          ts,
+          kind: "session_error",
+          name: "session",
+          message: `ended: ${err}`,
+        });
+      }
+    }
+  }
+  return failures;
+}
+
+function generateFixSuggestions(
+  classification: StuckClassification,
+  failures: FailureEntry[],
+  diagnosis: SessionDiagnosis,
+): string[] {
+  const suggestions: string[] = [];
+
+  // Classification-based suggestions
+  switch (classification) {
+    case "quota_suspended":
+      suggestions.push("Wait for quota to reset, or switch to a different provider/model.");
+      if (diagnosis.session.quotaSuspension?.failedProvider) {
+        suggestions.push(
+          `Check quota status for provider: ${diagnosis.session.quotaSuspension.failedProvider}`,
+        );
+      }
+      break;
+    case "subagent_wedged":
+      suggestions.push(
+        "The subagent appears stuck. Consider restarting the session with `openclaw sessions restart`.",
+      );
+      if (diagnosis.session.subagentRecovery?.automaticAttempts) {
+        suggestions.push(
+          `Automatic recovery attempted ${diagnosis.session.subagentRecovery.automaticAttempts} time(s) without success.`,
+        );
+      }
+      break;
+    case "blocked":
+      suggestions.push(
+        `Session goal is ${diagnosis.session.goal?.status}. Check budget/usage limits or unblock the goal.`,
+      );
+      break;
+    case "delivery_pending":
+      suggestions.push(
+        "Session has a pending delivery. Try `openclaw gateway restart` to flush pending messages.",
+      );
+      break;
+    case "lock_held":
+      suggestions.push(
+        `Lock held by PID ${diagnosis.lock.pid}. Check if that process is still alive.`,
+      );
+      if (diagnosis.lock.pidAlive === false) {
+        suggestions.push(
+          "The lock PID is not alive — the lock is stale. It should be cleaned up automatically.",
+        );
+      }
+      break;
+    case "stale":
+      suggestions.push(
+        "Session has been inactive for a long time. Consider restarting with `openclaw sessions restart`.",
+      );
+      break;
+    case "model_call":
+      suggestions.push(
+        "Session is waiting for a model response. Check provider status and API key validity.",
+      );
+      break;
+    case "tool_call":
+      suggestions.push("Session is stuck on a tool call. Check tool availability and permissions.");
+      break;
+    default:
+      break;
+  }
+
+  // Failure-based suggestions
+  const toolErrors = failures.filter((f) => f.kind === "tool_error" || f.kind === "tool_timeout");
+  const modelErrors = failures.filter(
+    (f) => f.kind === "model_error" || f.kind === "model_timeout",
+  );
+
+  if (toolErrors.length > 0) {
+    const toolNames = [...new Set(toolErrors.map((f) => f.name))].join(", ");
+    suggestions.push(
+      `Tool failures detected (${toolNames}). Verify tool configs and dependencies.`,
+    );
+  }
+  if (modelErrors.length > 0) {
+    suggestions.push(
+      "Model call errors detected. Check API key, rate limits, and provider health.",
+    );
+  }
+  if (failures.some((f) => f.kind === "tool_timeout")) {
+    suggestions.push(
+      "Tool timeouts detected. Check if external services are reachable and responsive.",
+    );
+  }
+
+  return suggestions;
+}
+
 function renderBriefRound(round: Round, roundIdx: number): string[] {
   const lines: string[] = [];
   const ts = round.startedAt ? formatTimestamp(round.startedAt) : "??";
@@ -817,6 +1000,17 @@ function renderBriefRound(round: Round, roundIdx: number): string[] {
       lines.push(
         `    ${evTs}  model call error: ${toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "unknown"}`,
       );
+    } else if (ev.type === "tool.call") {
+      // Show the tool call that preceded a failure for context
+      const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
+      const args = data?.arguments;
+      let argsPreview = "";
+      if (isRecord(args)) {
+        argsPreview = truncate(JSON.stringify(args), 120);
+      } else if (typeof args === "string") {
+        argsPreview = truncate(args, 120);
+      }
+      lines.push(`    ${evTs}  tool call: ${name}${argsPreview ? ` (${argsPreview})` : ""}`);
     } else if (ev.type === "tool.result" && data?.success === false) {
       const name = toOptionalString(data?.name) ?? toOptionalString(data?.toolName) ?? "tool";
       const errMsg = toOptionalString(data?.error) ?? toOptionalString(data?.message) ?? "";
@@ -885,6 +1079,55 @@ function colorizeClassification(label: string, c: StuckClassification, rich: boo
   return theme.muted(label);
 }
 
+function writeSummarySection(
+  diagnosis: SessionDiagnosis,
+  rich: boolean,
+  runtime: RuntimeEnv,
+): void {
+  const { failures, fixSuggestions } = diagnosis;
+
+  // Always show summary header
+  runtime.log(colorize(rich, theme.heading, "Summary"));
+  runtime.log("-".repeat(40));
+
+  if (failures.length === 0) {
+    runtime.log(
+      colorize(rich, theme.success, "  No failures detected in recent trajectory events."),
+    );
+  } else {
+    runtime.log(colorize(rich, theme.error, `  ${failures.length} failure(s) found:`));
+    // Group failures by kind for readability
+    const byKind = new Map<string, FailureEntry[]>();
+    for (const f of failures) {
+      const group = byKind.get(f.kind) ?? [];
+      group.push(f);
+      byKind.set(f.kind, group);
+    }
+    for (const [kind, entries] of byKind) {
+      const label = kind.replace(/_/gu, " ");
+      runtime.log(colorize(rich, theme.warn, `  [${label}] (${entries.length})`));
+      // Show up to 3 per kind to avoid flooding
+      for (const entry of entries.slice(0, 3)) {
+        runtime.log(
+          `    Round ${entry.roundIdx + 1} ${formatTimestamp(entry.ts)}  ${entry.name}: ${truncate(entry.message, 150)}`,
+        );
+      }
+      if (entries.length > 3) {
+        runtime.log(`    ... and ${entries.length - 3} more`);
+      }
+    }
+  }
+
+  if (fixSuggestions.length > 0) {
+    runtime.log("");
+    runtime.log(colorize(rich, theme.heading, "Suggested fixes:"));
+    for (const suggestion of fixSuggestions) {
+      runtime.log(`  - ${suggestion}`);
+    }
+  }
+  runtime.log("");
+}
+
 function writeTextOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void {
   const rich = isRich();
   const classLabel = classificationLabel(diagnosis.classification);
@@ -894,6 +1137,9 @@ function writeTextOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void
   runtime.log(colorize(rich, theme.heading, "=".repeat(50)));
   runtime.log(`Classification: ${coloredClass} -- ${diagnosis.summary}`);
   runtime.log("");
+
+  // Summary section with failures and suggestions
+  writeSummarySection(diagnosis, rich, runtime);
 
   // Session section
   runtime.log(colorize(rich, theme.heading, "Session"));
@@ -953,14 +1199,35 @@ function writeTextOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): void
     for (let ri = 0; ri < rounds.length; ri++) {
       const round = rounds[ri];
       const roundTs = round.startedAt ? formatTimestamp(round.startedAt) : "??";
+      const roundHasErrors = hasRoundErrors(round);
+      const roundLabel = roundHasErrors
+        ? colorize(rich, theme.error, `  --- Round ${ri + 1} (${roundTs}) [FAILURES] ---`)
+        : colorize(rich, theme.heading, `  --- Round ${ri + 1} (${roundTs}) ---`);
       runtime.log("");
-      runtime.log(colorize(rich, theme.heading, `  --- Round ${ri + 1} (${roundTs}) ---`));
+      runtime.log(roundLabel);
       for (let ei = 0; ei < round.events.length; ei++) {
         const ev = round.events[ei];
         const prev = ei > 0 ? round.events[ei - 1] : undefined;
         const rendered = renderEventLine(ev, prev, rich);
         for (const line of rendered) {
           runtime.log(line);
+        }
+      }
+      // Show round-level failure summary if there were errors
+      if (roundHasErrors) {
+        const roundFailures = diagnosis.failures.filter((f) => f.roundIdx === ri);
+        if (roundFailures.length > 0) {
+          runtime.log(colorize(rich, theme.error, `    >> Round ${ri + 1} failures:`));
+          for (const f of roundFailures) {
+            const kindLabel = f.kind.replace(/_/gu, " ");
+            runtime.log(
+              colorize(
+                rich,
+                theme.error,
+                `       ${kindLabel}: ${f.name} — ${truncate(f.message, 150)}`,
+              ),
+            );
+          }
         }
       }
       // Show pending markers at round level
@@ -1022,6 +1289,9 @@ function writeBriefOutput(diagnosis: SessionDiagnosis, runtime: RuntimeEnv): voi
   runtime.log(colorize(rich, theme.heading, `Session Diagnosis: ${diagnosis.sessionKey}`));
   runtime.log(`Classification: ${coloredClass} -- ${diagnosis.summary}`);
   runtime.log("");
+
+  // Summary section with failures and suggestions
+  writeSummarySection(diagnosis, rich, runtime);
 
   const s = diagnosis.session;
   if (s.quotaSuspension) {
@@ -1238,6 +1508,9 @@ export async function sessionsDiagnoseCommand(
     lastProgressAgeMs,
   });
 
+  // Collect failures and generate suggestions
+  const rounds = groupIntoRounds(trajectoryAnalysis.lastEvents.map(toDiagnosisEvent));
+  const failures = collectFailures(rounds);
   const now = Date.now();
   const diagnosis: SessionDiagnosis = {
     sessionKey: key,
@@ -1245,6 +1518,8 @@ export async function sessionsDiagnoseCommand(
     agentId,
     classification,
     summary,
+    failures,
+    fixSuggestions: [], // populated below after diagnosis is built
     session: {
       updatedAt: entry.updatedAt,
       ageMs: entry.updatedAt ? now - entry.updatedAt : undefined,
@@ -1300,6 +1575,9 @@ export async function sessionsDiagnoseCommand(
       lastProgressReason,
     },
   };
+
+  // Generate fix suggestions now that diagnosis is complete
+  diagnosis.fixSuggestions = generateFixSuggestions(classification, failures, diagnosis);
 
   if (opts.json) {
     writeRuntimeJson(runtime, diagnosis);
